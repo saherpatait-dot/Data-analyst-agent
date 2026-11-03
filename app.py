@@ -485,49 +485,54 @@ def _contributor_table(work, current_period, previous_period, metric, dimension,
     return comparison.head(top_n)
 
 
-
-
-def _full_contribution_summary(work, current_period, previous_period, metric, dimension):
-    """Calculate positive/negative contribution totals across every dimension value."""
+def _full_contributor_summary(work, current_period, previous_period, metric, dimension):
+    """Calculate complete-population contributor aggregates, not top-N extracts."""
     if not dimension:
-        return None
+        return {}
     comparison = _compare_periods(work, current_period, previous_period, [metric], dimension)
-    changes = pd.to_numeric(comparison[f"{metric}_change"], errors="coerce").dropna()
-    positive = changes[changes > 0]
-    negative = changes[changes < 0]
+    if comparison.empty:
+        return {}
+
+    change_col = f"{metric}_change"
+    current_col = f"{metric}_current"
+    previous_col = f"{metric}_previous"
+    comparison[change_col] = pd.to_numeric(comparison[change_col], errors="coerce").fillna(0)
+    positive = comparison[comparison[change_col] > 0].copy()
+    negative = comparison[comparison[change_col] < 0].copy()
+    total_positive = float(positive[change_col].sum())
+    total_negative = float(negative[change_col].sum())
+    net_change = float(comparison[change_col].sum())
+
+    def records(frame, ascending=False):
+        frame = frame.sort_values(change_col, ascending=ascending).head(5)
+        output = []
+        for _, row in frame.iterrows():
+            output.append({
+                str(dimension): str(row[dimension]),
+                "Current value": float(row[current_col]),
+                "Previous value": float(row[previous_col]),
+                "Absolute contribution": float(row[change_col]),
+                "Share of net change %": (
+                    float(row[change_col] / net_change * 100)
+                    if not np.isclose(net_change, 0) else None
+                ),
+            })
+        return output
+
     return {
-        "dimension": dimension,
-        "metric": metric,
-        "groups_compared": int(len(changes)),
-        "positive_group_count": int(len(positive)),
-        "positive_contribution_total": float(positive.sum()),
-        "negative_group_count": int(len(negative)),
-        "negative_contribution_total": float(negative.sum()),
-        "net_change": float(changes.sum()),
+        "dimension": str(dimension),
+        "metric": str(metric),
+        "groups_analyzed": int(len(comparison)),
+        "groups_increased": int((comparison[change_col] > 0).sum()),
+        "groups_decreased": int((comparison[change_col] < 0).sum()),
+        "groups_unchanged": int((comparison[change_col] == 0).sum()),
+        "total_positive_contribution": total_positive,
+        "total_negative_contribution": total_negative,
+        "net_change": net_change,
+        "top_5_increases": records(positive, ascending=False),
+        "top_5_decreases": records(negative, ascending=True),
     }
 
-
-def _format_full_contribution_summaries(report):
-    lines = [
-        "## Full-population contribution reconciliation",
-        "Calculated across every product/customer group, not only the displayed top 15.",
-        "Positive and negative contributions are separate; together they reconcile to net change."
-    ]
-    for section, summaries in (
-        ("Products", report.get("product_full_summaries", {})),
-        ("Customers", report.get("customer_full_summaries", {})),
-    ):
-        for metric, summary in summaries.items():
-            if not summary:
-                continue
-            lines.extend([
-                f"### {section} — {metric}",
-                f"- Groups compared: {summary['groups_compared']:,}",
-                f"- Positive groups: {summary['positive_group_count']:,}; total contribution: {summary['positive_contribution_total']:,.2f}",
-                f"- Negative groups: {summary['negative_group_count']:,}; total contribution: {summary['negative_contribution_total']:,.2f}",
-                f"- Net contribution across all groups: {summary['net_change']:,.2f}",
-            ])
-    return "\n".join(lines)
 
 def _period_label(period):
     return str(period)
@@ -557,14 +562,16 @@ def _build_business_report(df, date_col, metric_cols, period_type, region_col, p
         "regional": _compare_periods(work, selected, previous, metric_cols, region_col) if region_col else pd.DataFrame(),
         "products": {m: _contributor_table(work, selected, previous, m, product_col) for m in metric_cols} if product_col else {},
         "customers": {m: _contributor_table(work, selected, previous, m, customer_col) for m in metric_cols} if customer_col else {},
-        "product_full_summaries": {
-            m: _full_contribution_summary(work, selected, previous, m, product_col)
-            for m in metric_cols
-        } if product_col else {},
-        "customer_full_summaries": {
-            m: _full_contribution_summary(work, selected, previous, m, customer_col)
-            for m in metric_cols
-        } if customer_col else {},
+        "full_contributor_summaries": {
+            "products": {
+                m: _full_contributor_summary(work, selected, previous, m, product_col)
+                for m in metric_cols
+            } if product_col else {},
+            "customers": {
+                m: _full_contributor_summary(work, selected, previous, m, customer_col)
+                for m in metric_cols
+            } if customer_col else {},
+        },
         "work": work
     }
     return result
@@ -607,6 +614,13 @@ def _audit_ai_numeric_claims(text, verified_data):
     unsupported = []
     for match in pattern.finditer(normalized_text):
         token = match.group(0)
+        # Ignore generic mathematical phrases such as "does not sum to 100%";
+        # these are not claims about the uploaded dataset.
+        context_before = normalized_text[max(0, match.start() - 50):match.start()].lower()
+        if match.group("percent") and re.search(
+            r"(?:sum|add|total|equal|amount)\s+(?:up\s+)?to\s*$", context_before
+        ):
+            continue
         numeric = re.sub(r'[$₹€£,%\s]', '', token).replace(",", "")
         try:
             value = float(numeric)
@@ -660,20 +674,21 @@ def _groq_explanation(report):
                 m: t.head(15).replace({np.nan: None}).to_dict(orient="records")
                 for m, t in report["customers"].items()
             },
-            "full_population_product_contribution_summaries": report.get("product_full_summaries", {}),
-            "full_population_customer_contribution_summaries": report.get("customer_full_summaries", {}),
+            "complete_population_contributor_summaries_calculated_by_pandas": report.get(
+                "full_contributor_summaries", {}
+            ),
         }
 
         prompt = (
             "Write a concise, executive-ready business analysis using ONLY the supplied JSON. "
             "Treat the overall and regional tables as verified calculations. Product and customer "
             "tables are TOP-15 CONTRIBUTOR EXTRACTS, NOT complete populations. Never sum a top-15 "
-            "table and present it as the total for all products or customers. The separate full-population "
-            "summary fields contain verified totals across every group; use those exact values when relevant. "
-            "Do not invent, estimate, or derive approximate "
-            "figures. Use only numeric values explicitly present in the JSON; do not calculate new "
-            "percentages or totals. If a requested aggregate is not supplied, say it cannot be "
-            "determined from this extract. A zero previous-period value means 'no recorded sales "
+            "table and present it as the total for all products or customers. Use the complete-population "
+            "contributor summaries calculated by Pandas for total positive contribution, total negative "
+            "contribution, net change, group counts, and leading increases/decreases. These summaries "
+            "cover the full selected dimension population. Do not recalculate, approximate, or alter "
+            "their figures. Use only numeric values explicitly present in the JSON. If a summary is "
+            "missing, say the information is unavailable. A zero previous-period value means 'no recorded sales "
             "in the comparison period'; it does NOT prove a newly acquired customer, newly launched "
             "product, churn, reactivation, or launch. A zero current-period value does NOT prove "
             "permanent churn or discontinuation. Do not infer causes. Distinguish absolute change "
@@ -681,7 +696,11 @@ def _groq_explanation(report):
             "the previous value is zero or the percentage is not calculable. "
             "Include: Executive summary, period performance, regional findings, product and customer "
             "contributors, data limitations, and recommended next checks. Clearly state that product "
-            "and customer lists show at most 15 contributors per metric. Keep all figures exactly "
+            "and customer lists show at most 15 contributors per metric, BUT do not say complete "
+            "population contribution totals are unavailable: the supplied Pandas summaries cover "
+            "all product and customer groups. Do not recommend obtaining complete lists merely to "
+            "reconcile the aggregate net change, because the full-population summaries already do so. "
+            "You may recommend transaction-level detail for root-cause investigation. Keep all figures exactly "
             "as supplied, with sensible formatting only. If a fact is not present, omit it rather "
             "than guessing.\n\n"
             f"VERIFIED DATA JSON:\n{json.dumps(compact, default=str, ensure_ascii=False)}"
@@ -726,6 +745,50 @@ def _groq_explanation(report):
             )
 
         content = content.strip()
+
+        # Always append full-population figures from Pandas, independently of
+        # whether Groq remembered to include them correctly in its narrative.
+        deterministic_lines = [
+            "## Verified full-population contribution summary",
+            "",
+            "These figures are calculated by Pandas across every group in the selected periods, "
+            "not just the top-15 extracts.",
+            "",
+        ]
+        summaries = report.get("full_contributor_summaries", {})
+        for dimension_label, summary_key in (("Products", "products"), ("Customers", "customers")):
+            for metric_name, values in summaries.get(summary_key, {}).items():
+                if not values:
+                    continue
+                deterministic_lines.extend([
+                    f"### {dimension_label} — {metric_name}",
+                    f"- Groups analyzed: {values['groups_analyzed']:,}",
+                    f"- Groups with increases: {values['groups_increased']:,}",
+                    f"- Groups with decreases: {values['groups_decreased']:,}",
+                    f"- Unchanged groups: {values['groups_unchanged']:,}",
+                    f"- Total positive contribution: {values['total_positive_contribution']:,.2f}",
+                    f"- Total negative contribution: {values['total_negative_contribution']:,.2f}",
+                    f"- Net change across all groups: {values['net_change']:,.2f}",
+                    "",
+                ])
+        deterministic_lines.extend([
+            "**Reading signed contribution shares:** When overall net change is negative, "
+            "increases can have negative shares of net change and declines can have positive "
+            "shares. This is a mathematical effect of dividing by a negative net change. A "
+            "negative share does not mean the contributor's sales declined; read the absolute "
+            "contribution alongside the share.",
+            "",
+            "## Full-population data limitation clarification",
+            "The detailed product and customer contributor tables shown above are limited to the "
+            "top 15 entries per metric. However, the positive, negative, and net contribution "
+            "summaries above are calculated across the complete population of product and customer "
+            "groups. Therefore, the full-population aggregate reconciliation is available; the "
+            "remaining limitation is that every individual contributor is not listed in the "
+            "top-15 detail tables. Transaction-level data may still be needed to investigate causes.",
+            "",
+        ])
+        content += "\n\n" + "\n".join(deterministic_lines)
+
         unsupported_numbers = _audit_ai_numeric_claims(content, compact)
         if unsupported_numbers:
             flagged = ", ".join(unsupported_numbers[:12])
@@ -744,10 +807,6 @@ def _groq_explanation(report):
                 "were matched to values present in the supplied calculation tables. This checks "
                 "numeric traceability only; it does not prove that every sentence or interpretation is correct."
             )
-
-        deterministic_summary = _format_full_contribution_summaries(report)
-        if deterministic_summary.strip():
-            content += "\\n\\n---\\n\\n" + deterministic_summary
 
         return content, None
 
@@ -963,6 +1022,40 @@ def render_business_analysis(df):
                 st.markdown(f"**{metric}**")
                 st.dataframe(table, use_container_width=True, hide_index=True)
 
+    summaries = report.get("full_contributor_summaries", {})
+    if summaries:
+        with st.expander("Full-population contributor summary (Pandas-calculated)", expanded=True):
+            st.caption(
+                "These aggregates use every product/customer in the selected period comparison. "
+                "The detailed contributor tables above remain limited to the top 15."
+            )
+            for role, role_label in (("products", "Products"), ("customers", "Customers")):
+                role_summaries = summaries.get(role, {})
+                if role_summaries:
+                    st.markdown(f"**{role_label} — complete population**")
+                    for metric, summary in role_summaries.items():
+                        st.markdown(f"*{metric}*")
+                        st.dataframe(pd.DataFrame([{
+                            "Groups analyzed": summary["groups_analyzed"],
+                            "Increased": summary["groups_increased"],
+                            "Decreased": summary["groups_decreased"],
+                            "Unchanged": summary["groups_unchanged"],
+                            "Total positive contribution": summary["total_positive_contribution"],
+                            "Total negative contribution": summary["total_negative_contribution"],
+                            "Net change": summary["net_change"],
+                        }]).style.format({
+                            "Total positive contribution": "{:+,.2f}",
+                            "Total negative contribution": "{:+,.2f}",
+                            "Net change": "{:+,.2f}",
+                        }), use_container_width=True, hide_index=True)
+                        left, right = st.columns(2)
+                        with left:
+                            st.caption("Top 5 increases")
+                            st.dataframe(pd.DataFrame(summary["top_5_increases"]), use_container_width=True, hide_index=True)
+                        with right:
+                            st.caption("Top 5 decreases")
+                            st.dataframe(pd.DataFrame(summary["top_5_decreases"]), use_container_width=True, hide_index=True)
+
     st.markdown("#### AI-written business interpretation")
     st.session_state.setdefault("business_report_ai", None)
     st.session_state.setdefault("business_report_ai_error", None)
@@ -1008,12 +1101,13 @@ def render_business_analysis(df):
         export_frames[f"product_{metric}"] = table
     for metric, table in report["customers"].items():
         export_frames[f"customer_{metric}"] = table
-    for metric, summary in report.get("product_full_summaries", {}).items():
-        if summary:
-            export_frames[f"product_full_population_summary_{metric}"] = pd.DataFrame([summary])
-    for metric, summary in report.get("customer_full_summaries", {}).items():
-        if summary:
-            export_frames[f"customer_full_population_summary_{metric}"] = pd.DataFrame([summary])
+    for dimension_name, dimension_summaries in report.get("full_contributor_summaries", {}).items():
+        for metric, summary in dimension_summaries.items():
+            if summary:
+                export_frames[f"full_{dimension_name}_{metric}"] = pd.DataFrame([{
+                    key: value for key, value in summary.items()
+                    if key not in ("top_5_increases", "top_5_decreases")
+                }])
     csv_parts = []
     for name, frame in export_frames.items():
         csv_parts.append(f"# {name}\n{frame.to_csv(index=False)}")
