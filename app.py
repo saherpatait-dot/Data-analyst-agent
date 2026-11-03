@@ -1,11 +1,12 @@
 import re
 import os
 import json
+import math
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import streamlit as st
-import math
+
 st.set_page_config(page_title="AI Data Analyst", page_icon="📊", layout="wide")
 
 st.title("📊 AI Data Analyst")
@@ -518,7 +519,12 @@ def _build_business_report(df, date_col, metric_cols, period_type, region_col, p
 
 
 def _audit_ai_numeric_claims(text, verified_data):
-    """Flag currency/percentage figures in the AI narrative that are not in supplied facts."""
+    """Flag currency/percentage figures not traceable to supplied verified facts.
+
+    Normalize typographic minus/dash characters first. AI-generated Markdown often
+    uses U+2011/U+2212 instead of the ASCII hyphen, which otherwise makes a valid
+    negative percentage look like a positive value and creates false warnings.
+    """
     allowed = set()
 
     def collect(value):
@@ -528,13 +534,17 @@ def _audit_ai_numeric_claims(text, verified_data):
         elif isinstance(value, list):
             for item in value:
                 collect(item)
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        elif isinstance(value, (int, float, np.number)) and not isinstance(value, (bool, np.bool_)):
             if math.isfinite(float(value)):
                 number = float(value)
                 for digits in (0, 1, 2):
                     allowed.add(round(number, digits))
 
     collect(verified_data)
+
+    normalized_text = str(text).translate(str.maketrans({
+        "−": "-", "–": "-", "—": "-", "‑": "-", "‒": "-", "﹣": "-", "－": "-"
+    }))
 
     # Only audit explicit currency and percentage claims; ordinary section numbers
     # and years are intentionally excluded.
@@ -543,7 +553,7 @@ def _audit_ai_numeric_claims(text, verified_data):
         r'|(?P<percent>[-+]?\d[\d,]*(?:\.\d+)?\s*%)'
     )
     unsupported = []
-    for match in pattern.finditer(text):
+    for match in pattern.finditer(normalized_text):
         token = match.group(0)
         numeric = re.sub(r'[$₹€£,%\s]', '', token).replace(",", "")
         try:
@@ -554,9 +564,7 @@ def _audit_ai_numeric_claims(text, verified_data):
                    for candidate in allowed):
             unsupported.append(token)
 
-    # Preserve order while removing duplicate flags.
-    unsupported = list(dict.fromkeys(unsupported))
-    return unsupported
+    return list(dict.fromkeys(unsupported))
 
 
 def _groq_explanation(report):
