@@ -762,6 +762,17 @@ def render_business_analysis(df):
     if st.session_state.get("business_report_ai"):
         st.success("Groq analysis completed.")
         st.markdown(st.session_state["business_report_ai"])
+
+        interpretation_csv = pd.DataFrame({
+            "AI-written business interpretation": [st.session_state["business_report_ai"]]
+        }).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Download AI interpretation (CSV)",
+            data=interpretation_csv,
+            file_name="ai_business_interpretation.csv",
+            mime="text/csv",
+            key="download_ai_interpretation_csv",
+        )
     elif st.session_state.get("business_report_ai_error"):
         st.error(st.session_state["business_report_ai_error"])
     else:
