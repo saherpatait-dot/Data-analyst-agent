@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import streamlit as st
-
+import math
 st.set_page_config(page_title="AI Data Analyst", page_icon="📊", layout="wide")
 
 st.title("📊 AI Data Analyst")
