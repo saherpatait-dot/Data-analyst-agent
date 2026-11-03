@@ -517,8 +517,50 @@ def _build_business_report(df, date_col, metric_cols, period_type, region_col, p
     return result
 
 
+def _audit_ai_numeric_claims(text, verified_data):
+    """Flag currency/percentage figures in the AI narrative that are not in supplied facts."""
+    allowed = set()
+
+    def collect(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            if math.isfinite(float(value)):
+                number = float(value)
+                for digits in (0, 1, 2):
+                    allowed.add(round(number, digits))
+
+    collect(verified_data)
+
+    # Only audit explicit currency and percentage claims; ordinary section numbers
+    # and years are intentionally excluded.
+    pattern = re.compile(
+        r'(?P<currency>[$₹€£]\s*[-+]?\d[\d,]*(?:\.\d+)?)'
+        r'|(?P<percent>[-+]?\d[\d,]*(?:\.\d+)?\s*%)'
+    )
+    unsupported = []
+    for match in pattern.finditer(text):
+        token = match.group(0)
+        numeric = re.sub(r'[$₹€£,%\s]', '', token).replace(",", "")
+        try:
+            value = float(numeric)
+        except ValueError:
+            continue
+        if not any(abs(value - candidate) <= max(0.02, abs(candidate) * 0.0005)
+                   for candidate in allowed):
+            unsupported.append(token)
+
+    # Preserve order while removing duplicate flags.
+    unsupported = list(dict.fromkeys(unsupported))
+    return unsupported
+
+
 def _groq_explanation(report):
-    """Request a business narrative from Groq using only verified report calculations."""
+    """Request a constrained narrative and audit its explicit numeric claims."""
     try:
         api_key = st.secrets.get("GROQ_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
     except Exception:
@@ -550,27 +592,36 @@ def _groq_explanation(report):
                 report["regional"].head(30).replace({np.nan: None}).to_dict(orient="records")
                 if not report["regional"].empty else []
             ),
-            "product_contributions": {
-                m: t.head(10).replace({np.nan: None}).to_dict(orient="records")
+            "product_contributions_top_15_only": {
+                m: t.head(15).replace({np.nan: None}).to_dict(orient="records")
                 for m, t in report["products"].items()
             },
-            "customer_contributions": {
-                m: t.head(10).replace({np.nan: None}).to_dict(orient="records")
+            "customer_contributions_top_15_only": {
+                m: t.head(15).replace({np.nan: None}).to_dict(orient="records")
                 for m, t in report["customers"].items()
             },
         }
 
         prompt = (
-            "Write a clear, executive-ready business analysis report using ONLY the verified "
-            "calculations in the JSON below. Do not invent causes, columns, values, entities, "
-            "or business context. Distinguish observed facts from hypotheses. Explain regional "
-            "differences and identify products and customers that contributed to changes using "
-            "the supplied absolute contribution and share values. If a section has no data, say "
-            "it could not be assessed. Do not recalculate or alter numbers. Include: Executive "
-            "summary, period performance, regional findings, product drivers, customer drivers, "
-            "risks/data limitations, and recommended next checks. Do not imply causation from "
-            "contribution alone. Use concise Markdown and preserve the direction and meaning "
-            "of every supplied result.\n\n"
+            "Write a concise, executive-ready business analysis using ONLY the supplied JSON. "
+            "Treat the overall and regional tables as verified calculations. Product and customer "
+            "tables are TOP-15 CONTRIBUTOR EXTRACTS, NOT complete populations. Never sum a top-15 "
+            "table and present it as the total for all products or customers. Do not state the "
+            "total positive/negative contribution across all products or customers unless that "
+            "exact total is explicitly supplied. Do not invent, estimate, or derive approximate "
+            "figures. Use only numeric values explicitly present in the JSON; do not calculate new "
+            "percentages or totals. If a requested aggregate is not supplied, say it cannot be "
+            "determined from this extract. A zero previous-period value means 'no recorded sales "
+            "in the comparison period'; it does NOT prove a newly acquired customer, newly launched "
+            "product, churn, reactivation, or launch. A zero current-period value does NOT prove "
+            "permanent churn or discontinuation. Do not infer causes. Distinguish absolute change "
+            "from share of total change. Do not describe a contributor's percentage change when "
+            "the previous value is zero or the percentage is not calculable. "
+            "Include: Executive summary, period performance, regional findings, product and customer "
+            "contributors, data limitations, and recommended next checks. Clearly state that product "
+            "and customer lists show at most 15 contributors per metric. Keep all figures exactly "
+            "as supplied, with sensible formatting only. If a fact is not present, omit it rather "
+            "than guessing.\n\n"
             f"VERIFIED DATA JSON:\n{json.dumps(compact, default=str, ensure_ascii=False)}"
         )
 
@@ -579,11 +630,14 @@ def _groq_explanation(report):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a careful senior business analyst. Never fabricate data.",
+                    "content": (
+                        "You are a cautious senior business analyst. Numerical fidelity is more "
+                        "important than a persuasive narrative. Never fabricate or infer facts."
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
+            temperature=0.1,
             max_completion_tokens=3000,
             reasoning_effort="low",
             stream=False,
@@ -609,7 +663,27 @@ def _groq_explanation(report):
                 f"(finish reason: {finish_reason}). Try again or check the selected model."
             )
 
-        return content.strip(), None
+        content = content.strip()
+        unsupported_numbers = _audit_ai_numeric_claims(content, compact)
+        if unsupported_numbers:
+            flagged = ", ".join(unsupported_numbers[:12])
+            if len(unsupported_numbers) > 12:
+                flagged += f", and {len(unsupported_numbers) - 12} more"
+            content += (
+                "\n\n---\n\n"
+                "**Automatic numeric review:** Some currency or percentage figures in this "
+                "AI narrative could not be matched to the supplied verified calculation tables: "
+                f"{flagged}. Please treat those figures as unverified and review them before sharing."
+            )
+        else:
+            content += (
+                "\n\n---\n\n"
+                "**Automatic numeric review:** All explicit currency and percentage figures "
+                "were matched to values present in the supplied calculation tables. This checks "
+                "numeric traceability only; it does not prove that every sentence or interpretation is correct."
+            )
+
+        return content, None
 
     except Exception as exc:
         error_text = str(exc)
@@ -630,6 +704,83 @@ def _groq_explanation(report):
         else:
             detail = f"Groq request failed ({type(exc).__name__}): {error_text}"
         return None, detail
+
+
+
+def _business_interpretation_docx(markdown_text):
+    """Convert the Groq Markdown interpretation into a readable Word document."""
+    from io import BytesIO
+    from docx import Document
+    from docx.shared import Inches, Pt
+    import re
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    document.styles["Normal"].font.name = "Aptos"
+    document.styles["Normal"].font.size = Pt(10)
+
+    lines = markdown_text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i].strip()
+        if not raw:
+            i += 1
+            continue
+
+        # Markdown table: collect rows, skipping the separator row.
+        if raw.startswith("|") and i + 1 < len(lines) and re.match(r"^\|[\s:|-]+\|$", lines[i + 1].strip()):
+            table_rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [cell.strip() for cell in lines[i].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r"[:\- ]+", cell or "-") for cell in cells):
+                    table_rows.append(cells)
+                i += 1
+            if table_rows:
+                col_count = max(len(row) for row in table_rows)
+                table = document.add_table(rows=0, cols=col_count)
+                table.style = "Light Shading Accent 1"
+                for row_index, values in enumerate(table_rows):
+                    cells = table.add_row().cells
+                    for col_index in range(col_count):
+                        value = values[col_index] if col_index < len(values) else ""
+                        value = re.sub(r"\*\*(.*?)\*\*", r"\1", value)
+                        value = re.sub(r"`(.*?)`", r"\1", value)
+                        cells[col_index].text = value
+                        if row_index == 0:
+                            for run in cells[col_index].paragraphs[0].runs:
+                                run.bold = True
+            continue
+
+        heading_match = re.match(r"^(#{1,3})\s+(.*)$", raw)
+        if heading_match:
+            level = min(len(heading_match.group(1)), 3)
+            text_value = heading_match.group(2)
+            document.add_heading(text_value, level=level)
+        elif raw.startswith(("- ", "* ")):
+            paragraph = document.add_paragraph(style="List Bullet")
+            paragraph.add_run(raw[2:])
+        elif re.match(r"^\d+[.)]\s+", raw):
+            paragraph = document.add_paragraph(style="List Number")
+            paragraph.add_run(re.sub(r"^\d+[.)]\s+", "", raw))
+        elif raw.startswith("> "):
+            paragraph = document.add_paragraph(style="Quote")
+            paragraph.add_run(raw[2:])
+        elif raw in ("---", "***", "___"):
+            document.add_paragraph()
+        else:
+            paragraph = document.add_paragraph()
+            clean = re.sub(r"\*\*(.*?)\*\*", r"\1", raw)
+            clean = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", clean)
+            clean = re.sub(r"`(.*?)`", r"\1", clean)
+            paragraph.add_run(clean)
+        i += 1
+
+    buffer = BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def render_business_analysis(df):
@@ -763,16 +914,21 @@ def render_business_analysis(df):
         st.success("Groq analysis completed.")
         st.markdown(st.session_state["business_report_ai"])
 
-        interpretation_csv = pd.DataFrame({
-            "AI-written business interpretation": [st.session_state["business_report_ai"]]
-        }).to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ Download AI interpretation (CSV)",
-            data=interpretation_csv,
-            file_name="ai_business_interpretation.csv",
-            mime="text/csv",
-            key="download_ai_interpretation_csv",
-        )
+        try:
+            interpretation_docx = _business_interpretation_docx(
+                st.session_state["business_report_ai"]
+            )
+            st.download_button(
+                "⬇️ Download AI interpretation (Word)",
+                data=interpretation_docx,
+                file_name="ai_business_interpretation.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="download_ai_interpretation_docx",
+            )
+        except ImportError:
+            st.warning(
+                "Word export needs python-docx. Add it to requirements.txt and redeploy the app."
+            )
     elif st.session_state.get("business_report_ai_error"):
         st.error(st.session_state["business_report_ai_error"])
     else:
