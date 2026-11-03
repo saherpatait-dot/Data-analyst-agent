@@ -11,7 +11,7 @@ st.set_page_config(page_title="AI Data Analyst", page_icon="📊", layout="wide"
 st.title("📊 AI Data Analyst")
 st.caption("Upload a CSV or Excel file, explore it, and generate evidence-based business performance reports.")
 st.info(
-    "Core calculations run locally with Pandas. Optional NVIDIA Nemotron explains verified business findings when NVIDIA_API_KEY is configured."
+    "Core calculations run locally with Pandas. Optional Groq AI explains verified business findings when GROQ_API_KEY is configured."
 )
 
 MAX_FILE_MB = 200
@@ -517,31 +517,28 @@ def _build_business_report(df, date_col, metric_cols, period_type, region_col, p
     return result
 
 
-def _nemotron_explanation(report):
-    """Request a narrative from NVIDIA and return either text or a diagnostic error."""
+def _groq_explanation(report):
+    """Request a business narrative from Groq using only verified report calculations."""
     try:
-        api_key = st.secrets.get("NVIDIA_API_KEY", "") or os.getenv("NVIDIA_API_KEY", "")
+        api_key = st.secrets.get("GROQ_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
     except Exception:
-        api_key = os.getenv("NVIDIA_API_KEY", "")
+        api_key = os.getenv("GROQ_API_KEY", "")
 
     if not api_key:
         return None, (
-            "NVIDIA_API_KEY was not found. Add it to .streamlit/secrets.toml "
-            "or set it as an environment variable, then restart Streamlit."
+            "GROQ_API_KEY was not found. Add it to Streamlit Cloud Secrets "
+            "or to your local .streamlit/secrets.toml file."
         )
 
     try:
         from openai import OpenAI
 
-        model = os.getenv(
-            "NVIDIA_NEMOTRON_MODEL",
-            "nvidia/nemotron-3.5-super-vl-120b-a12b"
-        )
+        model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
         client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
+            base_url="https://api.groq.com/openai/v1",
             api_key=api_key,
-            timeout=60.0,
-            max_retries=0,
+            timeout=90.0,
+            max_retries=1,
         )
 
         compact = {
@@ -564,15 +561,16 @@ def _nemotron_explanation(report):
         }
 
         prompt = (
-            "Write an executive-ready business analysis report using ONLY the verified calculations in the JSON. "
-            "Do not invent causes, columns, values, entities, or business context. Distinguish observed facts from "
-            "hypotheses. Explain metric direction mismatches by region where present. Explain which products and "
-            "customers contributed to changes using the supplied absolute contribution and share values. "
-            "If a section has no data, say it could not be assessed. Do not recalculate or alter numbers. "
-            "Include: Executive summary, period performance, regional findings, product drivers, customer drivers, "
-            "risks/data limitations, and recommended next checks. Do not imply causation from contribution alone. "
-            "Format the answer in clear Markdown and round displayed percentages and values sensibly without "
-            "changing the direction or meaning of the supplied results.\n\n"
+            "Write a clear, executive-ready business analysis report using ONLY the verified "
+            "calculations in the JSON below. Do not invent causes, columns, values, entities, "
+            "or business context. Distinguish observed facts from hypotheses. Explain regional "
+            "differences and identify products and customers that contributed to changes using "
+            "the supplied absolute contribution and share values. If a section has no data, say "
+            "it could not be assessed. Do not recalculate or alter numbers. Include: Executive "
+            "summary, period performance, regional findings, product drivers, customer drivers, "
+            "risks/data limitations, and recommended next checks. Do not imply causation from "
+            "contribution alone. Use concise Markdown and preserve the direction and meaning "
+            "of every supplied result.\n\n"
             f"VERIFIED DATA JSON:\n{json.dumps(compact, default=str, ensure_ascii=False)}"
         )
 
@@ -581,25 +579,23 @@ def _nemotron_explanation(report):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a careful senior business analyst. Never fabricate data."
+                    "content": "You are a careful senior business analyst. Never fabricate data.",
                 },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=2200,
+            max_completion_tokens=3000,
+            reasoning_effort="low",
             stream=False,
         )
 
         if not getattr(response, "choices", None):
-            return None, (
-                f"NVIDIA returned an empty response for model '{model}'. "
-                "Check the model availability in NVIDIA Build and try again."
-            )
+            return None, f"Groq returned an empty response for model '{model}'."
 
-        message = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
         content = getattr(message, "content", None)
 
-        # Some OpenAI-compatible providers return content as text blocks.
         if isinstance(content, list):
             content = "\n".join(
                 str(part.get("text", "")) if isinstance(part, dict) else str(part)
@@ -607,31 +603,32 @@ def _nemotron_explanation(report):
             ).strip()
 
         if not isinstance(content, str) or not content.strip():
-            finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+            finish_reason = getattr(choice, "finish_reason", "unknown")
             return None, (
-                f"NVIDIA connected, but the model returned no displayable answer "
-                f"(finish reason: {finish_reason}). Try again or select another supported model."
+                "Groq connected, but the model returned no displayable answer "
+                f"(finish reason: {finish_reason}). Try again or check the selected model."
             )
 
         return content.strip(), None
 
     except Exception as exc:
-        # Return actionable diagnostics without ever printing or exposing the API key.
         error_text = str(exc)
         status_code = getattr(exc, "status_code", None)
         if status_code == 401:
-            detail = "NVIDIA rejected the API key (401). Check that the key is valid and active."
+            detail = "Groq rejected the API key (401). Check that GROQ_API_KEY is correct."
         elif status_code == 403:
-            detail = "NVIDIA denied access (403). Check model access and account permissions."
+            detail = "Groq denied access (403). Check model access and account limits."
         elif status_code == 404:
             detail = (
-                "NVIDIA returned 404. The selected model may not be available on this endpoint. "
-                "Check the exact model ID shown in your NVIDIA Build Playground."
+                f"Groq could not find the model '{os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')}'. "
+                "Check the model ID in the Groq Console."
             )
+        elif status_code == 429:
+            detail = "Groq rate limit reached. Wait a little and try again."
         elif "timeout" in error_text.lower() or "timed out" in error_text.lower():
-            detail = "The NVIDIA request timed out after 60 seconds. Try again in a moment."
+            detail = "The Groq request timed out. Try again in a moment."
         else:
-            detail = f"NVIDIA request failed ({type(exc).__name__}): {error_text}"
+            detail = f"Groq request failed ({type(exc).__name__}): {error_text}"
         return None, detail
 
 
@@ -753,17 +750,17 @@ def render_business_analysis(df):
     st.session_state.setdefault("business_report_ai", None)
     st.session_state.setdefault("business_report_ai_error", None)
 
-    if st.button("Explain verified findings with NVIDIA Nemotron", key="explain_nemotron"):
+    if st.button("Explain verified findings with Groq", key="explain_groq"):
         # Clear any earlier response so the user can see the outcome of this attempt.
         st.session_state["business_report_ai"] = None
         st.session_state["business_report_ai_error"] = None
-        with st.spinner("Connecting to NVIDIA Nemotron and preparing your business narrative..."):
-            explanation, error = _nemotron_explanation(report)
+        with st.spinner("Connecting to Groq and preparing your business narrative..."):
+            explanation, error = _groq_explanation(report)
         st.session_state["business_report_ai"] = explanation
         st.session_state["business_report_ai_error"] = error
 
     if st.session_state.get("business_report_ai"):
-        st.success("Nemotron analysis completed.")
+        st.success("Groq analysis completed.")
         st.markdown(st.session_state["business_report_ai"])
     elif st.session_state.get("business_report_ai_error"):
         st.error(st.session_state["business_report_ai_error"])
