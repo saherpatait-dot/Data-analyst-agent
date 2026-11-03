@@ -608,7 +608,9 @@ def _audit_ai_numeric_claims(text, verified_data):
     # Only audit explicit currency and percentage claims; ordinary section numbers
     # and years are intentionally excluded.
     pattern = re.compile(
-        r'(?P<currency>[$₹€£]\s*[-+]?\d[\d,]*(?:\.\d+)?)'
+        # Currency signs may appear before or after the symbol, e.g. -$1,234.56
+        # or $-1,234.56. Both forms must preserve the negative sign.
+        r'(?P<currency>[-+]?\s*[$₹€£]\s*[-+]?\d[\d,]*(?:\.\d+)?)'
         r'|(?P<percent>[-+]?\d[\d,]*(?:\.\d+)?\s*%)'
     )
     unsupported = []
@@ -698,9 +700,12 @@ def _groq_explanation(report):
             "contributors, data limitations, and recommended next checks. Clearly state that product "
             "and customer lists show at most 15 contributors per metric, BUT do not say complete "
             "population contribution totals are unavailable: the supplied Pandas summaries cover "
-            "all product and customer groups. Do not recommend obtaining complete lists merely to "
-            "reconcile the aggregate net change, because the full-population summaries already do so. "
-            "You may recommend transaction-level detail for root-cause investigation. Keep all figures exactly "
+            "all product and customer groups. The narrative may highlight up to five leading increases "
+            "and five leading decreases from the full-population summaries, while the separate detailed "
+            "contributor extracts contain up to 15 entries per metric. Label these detail levels accurately. "
+            "Do not recommend obtaining complete lists merely to reconcile the aggregate net change, "
+            "because the full-population summaries already do so. You may recommend transaction-level "
+            "detail for root-cause investigation. Keep all figures exactly "
             "as supplied, with sensible formatting only. If a fact is not present, omit it rather "
             "than guessing.\n\n"
             f"VERIFIED DATA JSON:\n{json.dumps(compact, default=str, ensure_ascii=False)}"
@@ -779,12 +784,14 @@ def _groq_explanation(report):
             "contribution alongside the share.",
             "",
             "## Full-population data limitation clarification",
-            "The detailed product and customer contributor tables shown above are limited to the "
-            "top 15 entries per metric. However, the positive, negative, and net contribution "
-            "summaries above are calculated across the complete population of product and customer "
-            "groups. Therefore, the full-population aggregate reconciliation is available; the "
-            "remaining limitation is that every individual contributor is not listed in the "
-            "top-15 detail tables. Transaction-level data may still be needed to investigate causes.",
+            "The on-screen product and customer contributor tables show up to 15 entries per "
+            "metric, ranked by absolute contribution. The AI narrative may highlight up to five "
+            "leading increases and five leading decreases. These are selected details, not complete "
+            "lists. The positive, negative, and net contribution summaries above are calculated "
+            "across the complete population of product and customer groups. Therefore, full-population "
+            "aggregate reconciliation is available; the limitation is that every individual group "
+            "is not listed in the detail tables. Transaction-level data may still be needed to "
+            "investigate causes.",
             "",
         ])
         content += "\n\n" + "\n".join(deterministic_lines)
