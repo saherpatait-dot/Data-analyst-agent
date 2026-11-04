@@ -10,7 +10,7 @@ import streamlit as st
 st.set_page_config(page_title="AI Data Analyst", page_icon="📊", layout="wide")
 
 st.title("📊 AI Data Analyst")
-st.caption("Upload a CSV or Excel file, explore it, and generate evidence-based business performance reports.")
+st.caption("Upload any CSV or Excel dataset. The analysis adapts to the columns and data available.")
 st.info(
     "Core calculations run locally with Pandas. Optional Groq AI explains verified business findings when GROQ_API_KEY is configured."
 )
@@ -166,11 +166,11 @@ def answer_question(df, question):
 
     if any(x in q for x in ("help", "what can you do", "example questions")):
         return result(
-            "### Try questions like these\n"
-            "- What is the total Sales?\n"
-            "- Which are the top 5 products by Sales?\n"
-            "- Compare Sales by Ship Mode.\n"
-            "- Show monthly Sales trends.\n"
+            "### Try questions using your own column names\n"
+            "- What is the total of [numeric column]?\n"
+            "- Which are the top 5 [categories] by [numeric column]?\n"
+            "- Compare [numeric column] by [category column].\n"
+            "- Show monthly trends using [date column].\n"
             "- Which columns have missing values?\n"
             "- Show correlations between numeric columns.\n"
             "- Summarize this dataset."
@@ -415,10 +415,13 @@ def _safe_period_frame(df, date_col, metric_cols, period_type):
     work = work.dropna(subset=["_report_date"])
     if work.empty:
         return None, None
-    if period_type == "Week-over-Week (WoW)":
-        work["_period"] = work["_report_date"].dt.to_period("W-SUN")
-    else:
-        work["_period"] = work["_report_date"].dt.to_period("Q")
+    frequency_map = {
+        "Week-over-Week (WoW)": "W-SUN",
+        "Month-over-Month (MoM)": "M",
+        "Quarter-over-Quarter (QoQ)": "Q",
+        "Year-over-Year (YoY)": "Y",
+    }
+    work["_period"] = work["_report_date"].dt.to_period(frequency_map.get(period_type, "W-SUN"))
     return work, sorted(work["_period"].dropna().unique())
 
 
@@ -538,43 +541,84 @@ def _period_label(period):
     return str(period)
 
 
-def _build_business_report(df, date_col, metric_cols, period_type, region_col, product_col, customer_col, current_label):
-    work, periods = _safe_period_frame(df, date_col, metric_cols, period_type)
-    if work is None or len(periods) < 2:
-        raise ValueError("At least two distinct populated weeks or quarters are required for a comparison.")
-    selected = next((p for p in periods if str(p) == current_label), periods[-1])
-    previous = selected - 1
-    if previous not in periods:
-        raise ValueError(
-            f"No data was found in the immediately preceding period ({_period_label(previous)}). "
-            "Choose a period with an adjacent comparison period or verify the date coverage."
-        )
-    result = {
-        "current_period": _period_label(selected),
-        "previous_period": _period_label(previous),
-        "period_type": period_type,
-        "date_column": date_col,
-        "metrics": metric_cols,
-        "region_column": region_col,
-        "product_column": product_col,
-        "customer_column": customer_col,
-        "overall": _compare_periods(work, selected, previous, metric_cols),
-        "regional": _compare_periods(work, selected, previous, metric_cols, region_col) if region_col else pd.DataFrame(),
-        "products": {m: _contributor_table(work, selected, previous, m, product_col) for m in metric_cols} if product_col else {},
-        "customers": {m: _contributor_table(work, selected, previous, m, customer_col) for m in metric_cols} if customer_col else {},
-        "full_contributor_summaries": {
-            "products": {
-                m: _full_contributor_summary(work, selected, previous, m, product_col)
-                for m in metric_cols
-            } if product_col else {},
-            "customers": {
-                m: _full_contributor_summary(work, selected, previous, m, customer_col)
-                for m in metric_cols
-            } if customer_col else {},
-        },
-        "work": work
+def _build_business_report(df, date_col, metric_cols, period_type, dimensions, current_label=None):
+    """Build a dataset-agnostic report using only columns present in the upload."""
+    if not metric_cols:
+        raise ValueError("Select at least one numeric business metric.")
+
+    if date_col:
+        work, periods = _safe_period_frame(df, date_col, metric_cols, period_type)
+        if work is None or len(periods) < 2:
+            raise ValueError("At least two populated periods are required for a period comparison.")
+        comparable = [p for p in periods if (p - 1) in periods]
+        if not comparable:
+            raise ValueError("No adjacent populated periods were found. Choose another frequency or check date coverage.")
+        selected = next((p for p in comparable if str(p) == current_label), comparable[-1])
+        previous = selected - 1
+        overall = _compare_periods(work, selected, previous, metric_cols)
+        dimension_results = {}
+        for dimension in dimensions:
+            if dimension not in work.columns or dimension in (date_col, "_period", "_report_date"):
+                continue
+            # Avoid an unreadable table for near-unique IDs; the user can still
+            # explicitly choose such a dimension if that is meaningful.
+            comparison = _compare_periods(work, selected, previous, metric_cols, dimension)
+            by_metric = {}
+            summaries = {}
+            for metric in metric_cols:
+                table = _contributor_table(work, selected, previous, metric, dimension, top_n=15)
+                summary = _full_contributor_summary(work, selected, previous, metric, dimension)
+                if not table.empty:
+                    by_metric[metric] = table
+                if summary:
+                    summaries[metric] = summary
+            if by_metric or summaries:
+                dimension_results[str(dimension)] = {"tables": by_metric, "summaries": summaries}
+
+        return {
+            "analysis_mode": "period_comparison",
+            "current_period": _period_label(selected),
+            "previous_period": _period_label(previous),
+            "period_type": period_type,
+            "date_column": date_col,
+            "metrics": list(metric_cols),
+            "overall": overall,
+            "dimensions": dimension_results,
+            "work": work,
+        }
+
+    # Snapshot mode: no date column is required. It produces descriptive metrics
+    # and optional dimension breakdowns without inventing a time comparison.
+    overall_rows = []
+    for metric in metric_cols:
+        values = pd.to_numeric(df[metric], errors="coerce").dropna()
+        if values.empty:
+            continue
+        overall_rows.append({
+            "Metric": str(metric), "Count": int(values.count()),
+            "Sum": float(values.sum()), "Mean": float(values.mean()),
+            "Median": float(values.median()), "Minimum": float(values.min()),
+            "Maximum": float(values.max()), "Standard deviation": float(values.std()) if len(values) > 1 else None,
+        })
+    dimension_results = {}
+    for dimension in dimensions:
+        if dimension not in df.columns:
+            continue
+        by_metric = {}
+        for metric in metric_cols:
+            table = df.groupby(dimension, dropna=False)[metric].agg(
+                Count="count", Total="sum", Average="mean"
+            ).reset_index().sort_values("Total", ascending=False).head(15)
+            if not table.empty:
+                by_metric[metric] = table
+        if by_metric:
+            dimension_results[str(dimension)] = {"tables": by_metric, "summaries": {}}
+    return {
+        "analysis_mode": "snapshot", "current_period": None, "previous_period": None,
+        "period_type": "Snapshot", "date_column": None, "metrics": list(metric_cols),
+        "overall": pd.DataFrame(overall_rows), "dimensions": dimension_results,
+        "work": df.copy(),
     }
-    return result
 
 
 def _audit_ai_numeric_claims(text, verified_data):
@@ -636,207 +680,103 @@ def _audit_ai_numeric_claims(text, verified_data):
 
 
 def _groq_explanation(report):
-    """Request a constrained narrative and audit its explicit numeric claims."""
+    """Generate a narrative from dynamically discovered, Pandas-verified facts."""
     try:
         api_key = st.secrets.get("GROQ_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
     except Exception:
         api_key = os.getenv("GROQ_API_KEY", "")
-
     if not api_key:
-        return None, (
-            "GROQ_API_KEY was not found. Add it to Streamlit Cloud Secrets "
-            "or to your local .streamlit/secrets.toml file."
-        )
+        return None, "GROQ_API_KEY was not found in Streamlit Cloud Secrets."
 
     try:
         from openai import OpenAI
-
         model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-        client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=api_key,
-            timeout=90.0,
-            max_retries=1,
-        )
-
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key, timeout=90.0, max_retries=1)
         compact = {
-            "comparison": f"{report['previous_period']} to {report['current_period']}",
-            "period_type": report["period_type"],
-            "date_column": report["date_column"],
-            "metrics": report["overall"].replace({np.nan: None}).to_dict(orient="records"),
-            "regional_results": (
-                report["regional"].head(30).replace({np.nan: None}).to_dict(orient="records")
-                if not report["regional"].empty else []
-            ),
-            "product_contributions_top_15_only": {
-                m: t.head(15).replace({np.nan: None}).to_dict(orient="records")
-                for m, t in report["products"].items()
+            "analysis_type": report["analysis_mode"],
+            "comparison": (f"{report['previous_period']} to {report['current_period']}"
+                           if report["analysis_mode"] == "period_comparison" else "Single-period snapshot; no date comparison performed"),
+            "period_type": report["period_type"], "date_column": report["date_column"],
+            "verified_metric_results": report["overall"].replace({np.nan: None}).to_dict(orient="records"),
+            "available_dimension_analyses": {
+                dimension: {
+                    "top_contributors_by_metric": {
+                        metric: table.replace({np.nan: None}).to_dict(orient="records")
+                        for metric, table in details["tables"].items()
+                    },
+                    "full_population_summaries_by_metric": details["summaries"],
+                } for dimension, details in report["dimensions"].items()
             },
-            "customer_contributions_top_15_only": {
-                m: t.head(15).replace({np.nan: None}).to_dict(orient="records")
-                for m, t in report["customers"].items()
-            },
-            "complete_population_contributor_summaries_calculated_by_pandas": report.get(
-                "full_contributor_summaries", {}
-            ),
         }
-
         prompt = (
-            "Write a concise, executive-ready business analysis using ONLY the supplied JSON. "
-            "Treat the overall and regional tables as verified calculations. Product and customer "
-            "tables are TOP-15 CONTRIBUTOR EXTRACTS, NOT complete populations. Never sum a top-15 "
-            "table and present it as the total for all products or customers. Use the complete-population "
-            "contributor summaries calculated by Pandas for total positive contribution, total negative "
-            "contribution, net change, group counts, and leading increases/decreases. These summaries "
-            "cover the full selected dimension population. Do not recalculate, approximate, or alter "
-            "their figures. Use only numeric values explicitly present in the JSON. If a summary is "
-            "missing, say the information is unavailable. A zero previous-period value means 'no recorded sales "
-            "in the comparison period'; it does NOT prove a newly acquired customer, newly launched "
-            "product, churn, reactivation, or launch. A zero current-period value does NOT prove "
-            "permanent churn or discontinuation. Do not infer causes. Distinguish absolute change "
-            "from share of total change. Do not describe a contributor's percentage change when "
-            "the previous value is zero or the percentage is not calculable. "
-            "Include: Executive summary, period performance, regional findings, product and customer "
-            "contributors, data limitations, and recommended next checks. Clearly state that product "
-            "and customer lists show at most 15 contributors per metric, BUT do not say complete "
-            "population contribution totals are unavailable: the supplied Pandas summaries cover "
-            "all product and customer groups. The narrative may highlight up to five leading increases "
-            "and five leading decreases from the full-population summaries, while the separate detailed "
-            "contributor extracts contain up to 15 entries per metric. Label these detail levels accurately. "
-            "Do not recommend obtaining complete lists merely to reconcile the aggregate net change, "
-            "because the full-population summaries already do so. You may recommend transaction-level "
-            "detail for root-cause investigation. Keep all figures exactly "
-            "as supplied, with sensible formatting only. If a fact is not present, omit it rather "
-            "than guessing.\n\n"
+            "Act as a careful, dataset-agnostic senior data analyst. Use ONLY the supplied JSON. "
+            "The uploaded dataset may describe any business or operational domain. Do not assume it is sales, "
+            "retail, HR, finance, or any other domain unless the column names and values support that. "
+            "Use the actual metric and dimension names. Discuss only dimensions present in the JSON. "
+            "Never invent missing regions, products, customers, categories, causes, or business context. "
+            "For period comparisons, explain what changed and quantify it using supplied verified figures. "
+            "For snapshot analysis, describe distributions and group differences without claiming a trend. "
+            "Distinguish observed facts from hypotheses. You may suggest plausible explanations only as "
+            "hypotheses requiring validation; do not state causes as facts. Tables under dimensions are "
+            "top-15 extracts and must not be summed to represent the full population. Use full-population "
+            "summaries only when they are actually present. If a dimension or summary is absent, omit that "
+            "section rather than printing an unavailable template. Mention relevant data limitations and "
+            "specific next checks based on the available columns. Include an executive summary, key findings, "
+            "dimension analysis only where available, limitations, and recommended next checks. Keep every "
+            "numeric figure exactly as supplied; do not calculate new numbers or guess.\n\n"
             f"VERIFIED DATA JSON:\n{json.dumps(compact, default=str, ensure_ascii=False)}"
         )
-
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a cautious senior business analyst. Numerical fidelity is more "
-                        "important than a persuasive narrative. Never fabricate or infer facts."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            max_completion_tokens=3000,
-            reasoning_effort="low",
-            stream=False,
+            messages=[{"role": "system", "content": "Numerical fidelity and evidence boundaries are more important than persuasive prose."},
+                      {"role": "user", "content": prompt}],
+            temperature=0.1, max_completion_tokens=3000, stream=False,
         )
-
         if not getattr(response, "choices", None):
             return None, f"Groq returned an empty response for model '{model}'."
-
-        choice = response.choices[0]
-        message = choice.message
-        content = getattr(message, "content", None)
-
+        content = getattr(response.choices[0].message, "content", None)
         if isinstance(content, list):
-            content = "\n".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part)
-                for part in content
-            ).strip()
-
+            content = "\n".join(str(x.get("text", "")) if isinstance(x, dict) else str(x) for x in content)
         if not isinstance(content, str) or not content.strip():
-            finish_reason = getattr(choice, "finish_reason", "unknown")
-            return None, (
-                "Groq connected, but the model returned no displayable answer "
-                f"(finish reason: {finish_reason}). Try again or check the selected model."
-            )
-
+            return None, "Groq connected but returned no displayable answer. Please try again."
         content = content.strip()
 
-        # Always append full-population figures from Pandas, independently of
-        # whether Groq remembered to include them correctly in its narrative.
-        deterministic_lines = [
-            "## Verified full-population contribution summary",
-            "",
-            "These figures are calculated by Pandas across every group in the selected periods, "
-            "not just the top-15 extracts.",
-            "",
-        ]
-        summaries = report.get("full_contributor_summaries", {})
-        for dimension_label, summary_key in (("Products", "products"), ("Customers", "customers")):
-            for metric_name, values in summaries.get(summary_key, {}).items():
-                if not values:
-                    continue
-                deterministic_lines.extend([
-                    f"### {dimension_label} — {metric_name}",
-                    f"- Groups analyzed: {values['groups_analyzed']:,}",
-                    f"- Groups with increases: {values['groups_increased']:,}",
-                    f"- Groups with decreases: {values['groups_decreased']:,}",
-                    f"- Unchanged groups: {values['groups_unchanged']:,}",
-                    f"- Total positive contribution: {values['total_positive_contribution']:,.2f}",
-                    f"- Total negative contribution: {values['total_negative_contribution']:,.2f}",
-                    f"- Net change across all groups: {values['net_change']:,.2f}",
-                    "",
+        # Add deterministic full-population summaries only when they exist.
+        verified_sections = []
+        for dimension, details in report["dimensions"].items():
+            for metric, summary in details["summaries"].items():
+                verified_sections.extend([
+                    f"### {dimension} — {metric}",
+                    f"- Groups analyzed: {summary['groups_analyzed']:,}",
+                    f"- Groups increased: {summary['groups_increased']:,}",
+                    f"- Groups decreased: {summary['groups_decreased']:,}",
+                    f"- Groups unchanged: {summary['groups_unchanged']:,}",
+                    f"- Total positive contribution: {summary['total_positive_contribution']:,.2f}",
+                    f"- Total negative contribution: {summary['total_negative_contribution']:,.2f}",
+                    f"- Net change: {summary['net_change']:,.2f}", "",
                 ])
-        deterministic_lines.extend([
-            "**Reading signed contribution shares:** When overall net change is negative, "
-            "increases can have negative shares of net change and declines can have positive "
-            "shares. This is a mathematical effect of dividing by a negative net change. A "
-            "negative share does not mean the contributor's sales declined; read the absolute "
-            "contribution alongside the share.",
-            "",
-            "## Full-population data limitation clarification",
-            "The on-screen product and customer contributor tables show up to 15 entries per "
-            "metric, ranked by absolute contribution. The AI narrative may highlight up to five "
-            "leading increases and five leading decreases. These are selected details, not complete "
-            "lists. The positive, negative, and net contribution summaries above are calculated "
-            "across the complete population of product and customer groups. Therefore, full-population "
-            "aggregate reconciliation is available; the limitation is that every individual group "
-            "is not listed in the detail tables. Transaction-level data may still be needed to "
-            "investigate causes.",
-            "",
-        ])
-        content += "\n\n" + "\n".join(deterministic_lines)
+        if verified_sections:
+            content += "\n\n## Verified full-population summaries\n\n" + "\n".join(verified_sections)
 
-        unsupported_numbers = _audit_ai_numeric_claims(content, compact)
-        if unsupported_numbers:
-            flagged = ", ".join(unsupported_numbers[:12])
-            if len(unsupported_numbers) > 12:
-                flagged += f", and {len(unsupported_numbers) - 12} more"
-            content += (
-                "\n\n---\n\n"
-                "**Automatic numeric review:** Some currency or percentage figures in this "
-                "AI narrative could not be matched to the supplied verified calculation tables: "
-                f"{flagged}. Please treat those figures as unverified and review them before sharing."
-            )
+        unsupported = _audit_ai_numeric_claims(content, compact)
+        if unsupported:
+            content += "\n\n---\n\n**Automatic numeric review:** These figures could not be matched to verified calculations: " + ", ".join(unsupported[:12]) + ". Review before sharing."
         else:
-            content += (
-                "\n\n---\n\n"
-                "**Automatic numeric review:** All explicit currency and percentage figures "
-                "were matched to values present in the supplied calculation tables. This checks "
-                "numeric traceability only; it does not prove that every sentence or interpretation is correct."
-            )
-
+            content += "\n\n---\n\n**Automatic numeric review:** All explicit currency and percentage figures were matched to values in the supplied calculation data. This checks numeric traceability, not the correctness of every interpretation."
         return content, None
-
     except Exception as exc:
-        error_text = str(exc)
         status_code = getattr(exc, "status_code", None)
         if status_code == 401:
-            detail = "Groq rejected the API key (401). Check that GROQ_API_KEY is correct."
+            detail = "Groq rejected the API key (401). Check GROQ_API_KEY in Streamlit Secrets."
         elif status_code == 403:
             detail = "Groq denied access (403). Check model access and account limits."
         elif status_code == 404:
-            detail = (
-                f"Groq could not find the model '{os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')}'. "
-                "Check the model ID in the Groq Console."
-            )
+            detail = f"Groq could not find model '{os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')}'."
         elif status_code == 429:
             detail = "Groq rate limit reached. Wait a little and try again."
-        elif "timeout" in error_text.lower() or "timed out" in error_text.lower():
-            detail = "The Groq request timed out. Try again in a moment."
         else:
-            detail = f"Groq request failed ({type(exc).__name__}): {error_text}"
+            detail = f"Groq request failed ({type(exc).__name__}): {exc}"
         return None, detail
-
 
 
 def _business_interpretation_docx(markdown_text):
@@ -916,215 +856,138 @@ def _business_interpretation_docx(markdown_text):
 
 
 def render_business_analysis(df):
-    st.header("📑 Business Analysis Report")
-    st.caption("Period-over-period performance, regional metric divergence, and product/customer contribution analysis.")
+    st.header("📑 Dynamic Business Analysis")
+    st.caption("Analysis options are built from the columns in your uploaded dataset. No fixed industry template is assumed.")
     discovery = _column_discovery(df)
     metric_options = discovery["metrics"]
-    date_cols = discovery["dates"]
-    with st.expander("Automatic column discovery", expanded=False):
-        st.write({
-            "Date columns": discovery["dates"],
-            "Business metrics": discovery["metrics"],
-            "Dimensions": discovery["dimensions"],
-            "Excluded identifier-like columns": discovery["identifiers"],
-        })
-    if not metric_options:
-        st.warning("No suitable numeric business measures were detected. Identifier-like numeric columns are excluded.")
-        return
-    if not date_cols:
-        st.warning("No reliable date column was detected. Add or select a date field to enable WoW/QoQ reporting.")
-        return
+    date_options = discovery["dates"]
+    dimension_options = discovery["dimensions"]
 
-    with st.expander("Configure report", expanded=True):
+    with st.expander("What the app detected", expanded=True):
         c1, c2, c3 = st.columns(3)
-        date_col = c1.selectbox("Date column", date_cols, key="biz_date")
-        period_type = c2.selectbox("Comparison frequency", ["Week-over-Week (WoW)", "Quarter-over-Quarter (QoQ)"])
-        metric_cols = c3.multiselect("Business metrics", metric_options, default=metric_options[:min(3, len(metric_options))], key="biz_metrics")
-        if not metric_cols:
-            st.info("Select at least one numeric metric.")
-            return
-        c4, c5, c6 = st.columns(3)
-        all_dimensions = _candidate_dimensions(df)
-        region_ranked = _candidate_dimensions(df, "region")
-        product_ranked = _candidate_dimensions(df, "product")
-        customer_ranked = _candidate_dimensions(df, "customer")
-        region_default = region_ranked[0] if region_ranked and _role_score(df, region_ranked[0], "region") >= 3 else "(Not available)"
-        product_default = product_ranked[0] if product_ranked and _role_score(df, product_ranked[0], "product") >= 3 else "(Not available)"
-        customer_default = customer_ranked[0] if customer_ranked and _role_score(df, customer_ranked[0], "customer") >= 3 else "(Not available)"
-        dimension_options = ["(Not available)"] + all_dimensions
-        region_choice = c4.selectbox("Regional dimension", dimension_options, index=dimension_options.index(region_default), key="biz_region")
-        product_choice = c5.selectbox("Product dimension", dimension_options, index=dimension_options.index(product_default), key="biz_product")
-        customer_choice = c6.selectbox("Customer dimension", dimension_options, index=dimension_options.index(customer_default), key="biz_customer")
-        if all_dimensions:
-            with st.expander("See all discovered dimensions"):
-                st.write(", ".join(map(str, all_dimensions)))
-        region_col = None if region_choice == "(Not available)" else region_choice
-        product_col = None if product_choice == "(Not available)" else product_choice
-        customer_col = None if customer_choice == "(Not available)" else customer_choice
+        c1.write("**Date/time columns**")
+        c1.write(date_options or "None detected")
+        c2.write("**Numeric measures**")
+        c2.write(metric_options or "None detected")
+        c3.write("**Potential dimensions**")
+        c3.write(dimension_options or "None detected")
+        st.caption("Column roles are suggestions based on data types, cardinality and column names. You can change the selections below.")
 
-    work, periods = _safe_period_frame(df, date_col, metric_cols, period_type)
-    if work is None or len(periods) < 2:
-        st.warning("At least two populated weeks or quarters are required.")
+    if not metric_options:
+        st.warning("No numeric measures were detected. This version needs at least one numeric column for business metric analysis.")
         return
-    comparable_periods = [p for p in periods if (p - 1) in periods]
-    if not comparable_periods:
-        st.warning("No adjacent populated periods were found. WoW/QoQ requires data in consecutive calendar periods.")
+
+    with st.expander("Configure analysis", expanded=True):
+        metric_cols = st.multiselect("Numeric measures to analyze", metric_options, default=metric_options[:min(3, len(metric_options))], key="dyn_metrics")
+        date_choices = ["(Snapshot — no date comparison)"] + date_options
+        date_choice = st.selectbox("Date/time column (optional)", date_choices, key="dyn_date")
+        date_col = None if date_choice.startswith("(") else date_choice
+        if date_col:
+            period_type = st.selectbox("Comparison frequency", ["Week-over-Week (WoW)", "Month-over-Month (MoM)", "Quarter-over-Quarter (QoQ)", "Year-over-Year (YoY)"], key="dyn_period_type")
+        else:
+            period_type = "Snapshot"
+        dimensions = st.multiselect("Dimensions to break down by (optional)", dimension_options, default=[], key="dyn_dimensions")
+
+    if not metric_cols:
+        st.info("Select at least one numeric measure to continue.")
         return
-    labels = [_period_label(p) for p in comparable_periods]
-    default_idx = len(labels) - 1
-    current_label = st.selectbox("Current period (compared with the immediately preceding calendar period)", labels, index=default_idx, key="biz_current")
-    if st.button("Generate business report", type="primary", key="generate_business_report"):
+
+    current_label = None
+    if date_col:
+        work, periods = _safe_period_frame(df, date_col, metric_cols, period_type)
+        if work is None or len(periods) < 2:
+            st.warning("This date column does not contain at least two populated periods.")
+            return
+        comparable = [p for p in periods if (p - 1) in periods]
+        if not comparable:
+            st.warning("No adjacent populated periods were found for this frequency. Try another frequency or inspect the date coverage.")
+            return
+        labels = [_period_label(p) for p in comparable]
+        current_label = st.selectbox("Current period (compared with the immediately preceding calendar period)", labels, index=len(labels)-1, key="dyn_current_period")
+
+    if st.button("Generate dynamic analysis", type="primary", key="generate_dynamic_report"):
         try:
-            report = _build_business_report(
-                df, date_col, metric_cols, period_type, region_col, product_col, customer_col, current_label
-            )
+            report = _build_business_report(df, date_col, metric_cols, period_type, dimensions, current_label)
             st.session_state["business_report_result"] = report
             st.session_state["business_report_ai"] = None
+            st.session_state["business_report_ai_error"] = None
+            st.session_state["dynamic_report_signature"] = (date_col, tuple(metric_cols), period_type, tuple(dimensions), current_label)
         except ValueError as exc:
             st.error(str(exc))
             return
 
     report = st.session_state.get("business_report_result")
     if not report:
-        st.info("Choose your dimensions and metrics, then generate the report.")
+        st.info("Choose the measures and optional dimensions, then generate the analysis.")
+        return
+    signature = (date_col, tuple(metric_cols), period_type, tuple(dimensions), current_label)
+    if st.session_state.get("dynamic_report_signature") != signature:
+        st.info("Your analysis settings changed. Generate the analysis again to refresh the results.")
         return
 
-    # Invalidate stale report if controls have changed.
-    if (report["date_column"] != date_col or report["metrics"] != metric_cols
-            or report["period_type"] != period_type or report["current_period"] != current_label
-            or report.get("region_column") != region_col
-            or report.get("product_column") != product_col
-            or report.get("customer_column") != customer_col):
-        st.info("Your report settings changed. Generate the report again to refresh the calculations.")
-        return
+    if report["analysis_mode"] == "period_comparison":
+        st.subheader(f"{report['previous_period']} → {report['current_period']}")
+        st.markdown("#### Overall metric movement")
+        st.dataframe(report["overall"].style.format({"Current": "{:,.2f}", "Previous": "{:,.2f}", "Absolute change": "{:+,.2f}", "Change %": "{:+.2f}%"}, na_rep="Not calculable"), use_container_width=True, hide_index=True)
+    else:
+        st.subheader("Dataset snapshot")
+        st.caption("No date comparison was selected or detected. These are descriptive statistics, not trends.")
+        st.dataframe(report["overall"], use_container_width=True, hide_index=True)
 
-    st.subheader(f"{report['previous_period']} → {report['current_period']}")
-    st.markdown("#### Overall metric movement")
-    st.dataframe(report["overall"].style.format({
-        "Current": "{:,.2f}", "Previous": "{:,.2f}",
-        "Absolute change": "{:+,.2f}", "Change %": "{:+.2f}%"
-    }, na_rep="Not calculable"), use_container_width=True, hide_index=True)
+    if report["dimensions"]:
+        st.markdown("#### Dimension breakdowns")
+        for dimension, details in report["dimensions"].items():
+            with st.expander(f"{dimension} analysis", expanded=True):
+                for metric, table in details["tables"].items():
+                    st.markdown(f"**{metric} — selected groups**")
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+                for metric, summary in details["summaries"].items():
+                    st.markdown(f"**{metric} — full-population summary**")
+                    summary_row = pd.DataFrame([{
+                        "Groups analyzed": summary["groups_analyzed"],
+                        "Increased": summary["groups_increased"],
+                        "Decreased": summary["groups_decreased"],
+                        "Unchanged": summary["groups_unchanged"],
+                        "Positive contribution": summary["total_positive_contribution"],
+                        "Negative contribution": summary["total_negative_contribution"],
+                        "Net change": summary["net_change"],
+                    }])
+                    st.dataframe(summary_row, use_container_width=True, hide_index=True)
+    else:
+        st.info("No dimensions were selected or detected for breakdowns. The report contains metric-level analysis only.")
 
-    if not report["regional"].empty:
-        st.markdown("#### Regional performance")
-        regional = report["regional"]
-        st.dataframe(regional, use_container_width=True, hide_index=True)
-        for metric in metric_cols:
-            change_col = f"{metric}_change"
-            pct_col = f"{metric}_change_pct"
-            if change_col in regional:
-                positive = regional[change_col] > 0
-                negative = regional[change_col] < 0
-                if positive.any() and negative.any():
-                    st.warning(f"{metric}: regions moved in different directions. Review the regional table for the actual increases and decreases.")
-                elif positive.any():
-                    st.info(f"{metric}: all regions with non-zero movement increased.")
-                elif negative.any():
-                    st.info(f"{metric}: all regions with non-zero movement decreased.")
-
-    for section_name, section_data in (("Product contribution", report["products"]), ("Customer contribution", report["customers"])):
-        if section_data:
-            st.markdown(f"#### {section_name}")
-            for metric, table in section_data.items():
-                st.markdown(f"**{metric}**")
-                st.dataframe(table, use_container_width=True, hide_index=True)
-
-    summaries = report.get("full_contributor_summaries", {})
-    if summaries:
-        with st.expander("Full-population contributor summary (Pandas-calculated)", expanded=True):
-            st.caption(
-                "These aggregates use every product/customer in the selected period comparison. "
-                "The detailed contributor tables above remain limited to the top 15."
-            )
-            for role, role_label in (("products", "Products"), ("customers", "Customers")):
-                role_summaries = summaries.get(role, {})
-                if role_summaries:
-                    st.markdown(f"**{role_label} — complete population**")
-                    for metric, summary in role_summaries.items():
-                        st.markdown(f"*{metric}*")
-                        st.dataframe(pd.DataFrame([{
-                            "Groups analyzed": summary["groups_analyzed"],
-                            "Increased": summary["groups_increased"],
-                            "Decreased": summary["groups_decreased"],
-                            "Unchanged": summary["groups_unchanged"],
-                            "Total positive contribution": summary["total_positive_contribution"],
-                            "Total negative contribution": summary["total_negative_contribution"],
-                            "Net change": summary["net_change"],
-                        }]).style.format({
-                            "Total positive contribution": "{:+,.2f}",
-                            "Total negative contribution": "{:+,.2f}",
-                            "Net change": "{:+,.2f}",
-                        }), use_container_width=True, hide_index=True)
-                        left, right = st.columns(2)
-                        with left:
-                            st.caption("Top 5 increases")
-                            st.dataframe(pd.DataFrame(summary["top_5_increases"]), use_container_width=True, hide_index=True)
-                        with right:
-                            st.caption("Top 5 decreases")
-                            st.dataframe(pd.DataFrame(summary["top_5_decreases"]), use_container_width=True, hide_index=True)
-
-    st.markdown("#### AI-written business interpretation")
-    st.session_state.setdefault("business_report_ai", None)
-    st.session_state.setdefault("business_report_ai_error", None)
-
+    st.markdown("#### AI-written interpretation")
     if st.button("Explain verified findings with Groq", key="explain_groq"):
-        # Clear any earlier response so the user can see the outcome of this attempt.
         st.session_state["business_report_ai"] = None
         st.session_state["business_report_ai_error"] = None
-        with st.spinner("Connecting to Groq and preparing your business narrative..."):
+        with st.spinner("Interpreting the available dataset findings..."):
             explanation, error = _groq_explanation(report)
         st.session_state["business_report_ai"] = explanation
         st.session_state["business_report_ai_error"] = error
 
     if st.session_state.get("business_report_ai"):
-        st.success("Groq analysis completed.")
+        st.success("AI interpretation completed.")
         st.markdown(st.session_state["business_report_ai"])
-
         try:
-            interpretation_docx = _business_interpretation_docx(
-                st.session_state["business_report_ai"]
-            )
-            st.download_button(
-                "⬇️ Download AI interpretation (Word)",
-                data=interpretation_docx,
+            docx_data = _business_interpretation_docx(st.session_state["business_report_ai"])
+            st.download_button("⬇️ Download AI interpretation (Word)", data=docx_data,
                 file_name="ai_business_interpretation.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="download_ai_interpretation_docx",
-            )
+                key="download_ai_interpretation_docx")
         except ImportError:
-            st.warning(
-                "Word export needs python-docx. Add it to requirements.txt and redeploy the app."
-            )
+            st.warning("Word export requires python-docx. Add it to requirements.txt and redeploy.")
     elif st.session_state.get("business_report_ai_error"):
         st.error(st.session_state["business_report_ai_error"])
-    else:
-        st.caption("Click the button above to generate an AI explanation of the verified report calculations.")
 
-    # Download calculations as an auditable workbook-like CSV bundle.
     export_frames = {"overall": report["overall"]}
-    if not report["regional"].empty:
-        export_frames["regional"] = report["regional"]
-    for metric, table in report["products"].items():
-        export_frames[f"product_{metric}"] = table
-    for metric, table in report["customers"].items():
-        export_frames[f"customer_{metric}"] = table
-    for dimension_name, dimension_summaries in report.get("full_contributor_summaries", {}).items():
-        for metric, summary in dimension_summaries.items():
-            if summary:
-                export_frames[f"full_{dimension_name}_{metric}"] = pd.DataFrame([{
-                    key: value for key, value in summary.items()
-                    if key not in ("top_5_increases", "top_5_decreases")
-                }])
-    csv_parts = []
-    for name, frame in export_frames.items():
-        csv_parts.append(f"# {name}\n{frame.to_csv(index=False)}")
-    st.download_button(
-        "⬇️ Download report calculations (CSV)",
-        data="\n".join(csv_parts).encode("utf-8"),
-        file_name="business_analysis_report.csv",
-        mime="text/csv"
-    )
-
+    for dimension, details in report["dimensions"].items():
+        for metric, table in details["tables"].items():
+            export_frames[f"dimension_{dimension}_{metric}"] = table
+        for metric, summary in details["summaries"].items():
+            export_frames[f"full_population_{dimension}_{metric}"] = pd.DataFrame([{k: v for k, v in summary.items() if k not in ("top_5_increases", "top_5_decreases")}])
+    csv_parts = [f"# {name}\n{frame.to_csv(index=False)}" for name, frame in export_frames.items()]
+    st.download_button("⬇️ Download analysis calculations (CSV)", data="\n".join(csv_parts).encode("utf-8"),
+        file_name="business_analysis_report.csv", mime="text/csv", key="download_dynamic_csv")
 
 
 analysis_mode = st.radio("Workspace", ["💬 Data Analyst", "📑 Business Analysis Report"], horizontal=True)
@@ -1181,7 +1044,7 @@ if uploaded is not None:
 
         if analysis_mode == "💬 Data Analyst":
             st.header("💬 Ask the Data Analyst")
-            st.caption("Examples: “top 5 products by Sales”, “compare Sales by Ship Mode”, “show monthly Sales trend”, “summarize dataset”.")
+            st.caption("Ask using the column names in your upload, e.g. “total of [measure]”, “top 5 [groups] by [measure]”, or “show trends by [date]”.")
             file_signature = f"{uploaded.name}:{uploaded.size}"
             if st.session_state.get("dataset_signature") != file_signature:
                 st.session_state.dataset_signature = file_signature
@@ -1225,10 +1088,10 @@ if uploaded is not None:
         st.error(f"Could not read or analyze this file: {exc}")
 else:
     st.markdown("### What you can ask")
-    st.write("- What is the total Sales?")
-    st.write("- Which are the top 5 products by Sales?")
-    st.write("- Compare Sales by Ship Mode.")
-    st.write("- Show monthly Sales trends.")
+    st.write("- What is the total of [numeric column]?")
+    st.write("- Which are the top 5 [groups] by [numeric column]?")
+    st.write("- Compare [numeric column] by [category column].")
+    st.write("- Show trends using [date column].")
     st.write("- Which columns have missing values?")
     st.write("- Show correlations between numeric columns.")
     st.write("- Summarize this dataset.")
